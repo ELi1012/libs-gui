@@ -284,9 +284,6 @@ class CoreXYController(QWidget):
         self.current_mpos_x = 0.0  # Used for physical machine tracking
         self.current_mpos_y = 0.0
         
-        # Timer to poll FluidNC status (`?`) automatically
-        self.poll_timer = QTimer()
-        self.poll_timer.timeout.connect(self.poll_status)
 
         # Reference Point (Sample Location)
         self.sample_x = None
@@ -300,6 +297,9 @@ class CoreXYController(QWidget):
         # default feed rate
         self.DEFAULT_FEED_RATE = 800        # mm/min
         # TODO: set feed rate on serial connection
+
+        # how often to update position
+        self.MOTION_REPORTING_INTERVAL = 50     # milliseconds
 
 
         self.initUI()
@@ -448,10 +448,6 @@ class CoreXYController(QWidget):
         self.btn_raster.clicked.connect(self.start_scan)
         main_layout.addWidget(self.btn_raster)
 
-        btn_status = QPushButton('Query Status')
-        btn_status.clicked.connect(self.poll_status)
-        main_layout.addWidget(btn_status)
-
         # finish setup
         self.setLayout(main_layout)
 
@@ -518,18 +514,6 @@ class CoreXYController(QWidget):
         commands = generate_raster_commands(sampleWidth, sampleHeight, resolution, 1000).split('\n')
         for command in commands:
             self.send_gcode(command)
-        
-
-
-    # to get current stage position
-    def poll_status(self):
-        """Sends the GRBL status query command character."""
-        if self.serial_port and self.serial_port.is_open:
-            try:
-                self.serial_port.write(b'?')
-                pass
-            except Exception as e:
-                print(f"Polling error: {e}")
 
 
     def jog(self, axis, direction):
@@ -582,6 +566,20 @@ class CoreXYController(QWidget):
         """Returns the actual system device name to pass to your serial handler."""
         return self.port_combo.currentData()
     
+    def onConnect(self):
+        # Start polling GRBL for status updates every 100ms
+        self.reader_thread = threading.Thread(target=self.read_from_device, daemon=True)
+        self.reader_thread.start()
+        
+        # Wake up and initialize GRBL
+        self.serial_port.write(b"\r\n\r\n")
+        time.sleep(2)
+        self.serial_port.reset_input_buffer()
+
+        self.send_gcode('$#')   # load existing sample coordinates
+        self.send_gcode('$10=0')   # set query to return work position (WPos)
+        self.send_gcode(f'$Report/Interval={self.MOTION_REPORTING_INTERVAL}')   # set automatic querying
+    
 
     def toggle_connection(self):
         if self.serial_port is None or not self.serial_port.is_open:
@@ -590,22 +588,12 @@ class CoreXYController(QWidget):
                 self.serial_port = serial.Serial(self.get_selected_port(), 115200, timeout=0.1)
                 self.btn_connect.setText('Disconnect')
 
-                # Start polling GRBL for status updates every 100ms
-                self.poll_timer.start(100)
-                self.reader_thread = threading.Thread(target=self.read_from_device, daemon=True)
-                self.reader_thread.start()
-                
-                # Wake up and initialize GRBL
-                self.serial_port.write(b"\r\n\r\n")
-                time.sleep(2)
-                self.serial_port.reset_input_buffer()
+                self.onConnect()
 
-                self.send_gcode('$#')   # load existing sample coordinates
 
             except Exception as e:
                 print(f"Connection Error: {e}")
         else:
-            self.poll_timer.stop()
             # close reader threaad
             self.reader_thread.join(timeout=1)
 
