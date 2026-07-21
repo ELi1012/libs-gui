@@ -501,9 +501,6 @@ class CoreXYController(QWidget):
         self.send_gcode('$#')
 
 
-
-
-
     def start_scan(self):
         
         if not self.stages_config.sample_dimensions_valid():
