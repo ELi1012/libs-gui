@@ -297,6 +297,8 @@ class CoreXYController(QWidget):
         # default feed rate
         self.DEFAULT_FEED_RATE = 800        # mm/min
         # TODO: set feed rate on serial connection
+        self.MAX_STAGE_SPEED = 20       # mm/min
+        self.MIN_STAGE_SPEED = 1        # mm/min
 
         # how often to update position
         self.MOTION_REPORTING_INTERVAL = 50     # milliseconds
@@ -414,11 +416,19 @@ class CoreXYController(QWidget):
         scanning_config = ConfigCard("Scan Options")
         scanning_layout = QVBoxLayout()
 
+        # resolution
         res_layout = QHBoxLayout()
         res_layout.addWidget(QLabel("Scan Resolution (mm)"))
         self.scan_resolution = QLineEdit('1')
         res_layout.addWidget(self.scan_resolution)
         scanning_layout.addLayout(res_layout)
+
+        # speed
+        spd_layout = QHBoxLayout()
+        spd_layout.addWidget(QLabel("Speed (mm/s)"))
+        self.scan_speed = QLineEdit('20')
+        spd_layout.addWidget(self.scan_speed)
+        scanning_layout.addLayout(spd_layout)
 
         scanning_config.addLayoutToCard(scanning_layout)
         main_layout.addWidget(scanning_config)
@@ -447,6 +457,11 @@ class CoreXYController(QWidget):
         self.btn_raster = QPushButton('START SCAN')
         self.btn_raster.clicked.connect(self.start_scan)
         main_layout.addWidget(self.btn_raster)
+
+        # unlock button (temporary)
+        self.btn_unlock = QPushButton('Unlock Alarm')
+        self.btn_unlock.clicked.connect(lambda: self.send_gcode('$X'))
+        main_layout.addWidget(self.btn_unlock)
 
         # finish setup
         self.setLayout(main_layout)
@@ -498,20 +513,44 @@ class CoreXYController(QWidget):
 
 
     def start_scan(self):
-        
+        def stage_to_motor_speed(stage_spd):
+            '''Assumes input speed is mm/second.
+            Output speed is in mm/min.
+            CoreXY formula: motor speed = half of stage speed
+            '''
+
+            return (stage_spd/2) * 60
+
+
+        # --- input validation ---
         if not self.stages_config.sample_dimensions_valid():
             print("Cannot start scan without valid sample dimensions.")
             return
         
         if not self.scan_resolution.text().strip():
             print("Cannot start scan without resolution input.")
-        
+            return
+
+        spd = self.scan_speed.text().strip()
+        if not spd:
+            print("Input speed before starting scan.")
+            return
+
+        if not int(spd):
+            print("Input speed must be an integer.")
+            return
+
+        spd = int(spd)
+        if spd < 1 or spd > 20:
+            print(f'Scan speed must be within the limit: [{self.MIN_STAGE_SPEED}, {self.MAX_STAGE_SPEED}] mm/min')
+            return
+    
         sampleWidth = int(self.stages_config.get_sample_width())
         sampleHeight = int(self.stages_config.get_sample_height())
         resolution = int(self.scan_resolution.text().strip())
+        feed_rate = stage_to_motor_speed(spd)
 
-
-        commands = generate_raster_commands(sampleWidth, sampleHeight, resolution, 1000).split('\n')
+        commands = generate_raster_commands(sampleWidth, sampleHeight, resolution, feed_rate).split('\n')
         for command in commands:
             self.send_gcode(command)
 
@@ -567,6 +606,7 @@ class CoreXYController(QWidget):
         return self.port_combo.currentData()
     
     def onConnect(self):
+        '''Sets up GRBL config.'''
         # Start polling GRBL for status updates every 100ms
         self.reader_thread = threading.Thread(target=self.read_from_device, daemon=True)
         self.reader_thread.start()
@@ -576,9 +616,13 @@ class CoreXYController(QWidget):
         time.sleep(2)
         self.serial_port.reset_input_buffer()
 
+
+        # TODO: remove
+        self.send_gcode("$X")
         self.send_gcode('$#')   # load existing sample coordinates
         self.send_gcode('$10=0')   # set query to return work position (WPos)
         self.send_gcode(f'$Report/Interval={self.MOTION_REPORTING_INTERVAL}')   # set automatic querying
+        self.send_gcode(f'G21 G17 F{self.DEFAULT_FEED_RATE}')   # units in mm, XY plane, speed
     
 
     def toggle_connection(self):
