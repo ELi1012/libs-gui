@@ -16,6 +16,7 @@ Misc notes:
 
 
 import sys
+from typing import Literal
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLineEdit, QLabel, QGridLayout,
                              QFrame, QComboBox)
@@ -28,6 +29,7 @@ import time
 import re
 
 from raster import generate_raster_commands
+from sample import Point, SpanEndpoints
 
 
 
@@ -97,6 +99,7 @@ class StageSizeConfig(QWidget):
         sample_layout = QGridLayout()
         # sample_layout.setSpacing(8)
 
+        # manual width/height input
         sample_layout.addWidget(QLabel("Width (cm):"), 0, 0)
         s_winput = QLineEdit()
         sample_layout.addWidget(s_winput, 0, 1)
@@ -107,7 +110,7 @@ class StageSizeConfig(QWidget):
         sample_layout.addWidget(s_hinput, 1, 1)
         self.sample_frame.addLayoutToCard(sample_layout)
         self.sample['height_input'] = s_hinput
-        
+
 
         # Gantry
         self.gantry = {
@@ -134,6 +137,12 @@ class StageSizeConfig(QWidget):
         self.gantry['height_input'] = g_hinput
 
         self.setLayout(self.config_layout)
+
+    def setWidth(self, newWidth):
+        self.sample['width_input'].setText(newWidth)
+
+    def setHeight(self, newHeight):
+        self.sample['height_input'].setText(newHeight)
 
 
     
@@ -196,12 +205,13 @@ class StageSizeConfig(QWidget):
 
         # empty?
         if not width or not height:
+            print('empty')
             return False
         
-        # is int?
+        # is number?
         try:
-            int(width)
-            int(height)
+            float(width)
+            float(height)
         except ValueError:
             return False
         
@@ -283,12 +293,17 @@ class CoreXYController(QWidget):
 
         self.current_mpos_x = 0.0  # Used for physical machine tracking
         self.current_mpos_y = 0.0
+
         
 
         # Reference Point (Sample Location)
         self.sample_x = None
         self.sample_y = None
         self.sample_coordinate_offset = (0, 0)      # update when connecting
+        self.sample_span_corners = SpanEndpoints(
+            Point(None, None),
+            Point(None, None)
+        )
 
         # send-line protocol
         self.command_semaphore = threading.Semaphore(1) # Allows 1 command at a time
@@ -331,13 +346,56 @@ class CoreXYController(QWidget):
         stages_config = StageSizeConfig()
         self.stages_config = stages_config
 
-
         main_layout.addWidget(stages_config)
 
         sample_width = stages_config.get_sample_width()
         sample_height = stages_config.get_sample_height()
         gantry_width = stages_config.get_gantry_width()
         gantry_height = stages_config.get_gantry_height()
+
+
+        # Set sample dimensions via jogging
+
+        sdim_layout = QVBoxLayout()
+        smeasure_start_end = QHBoxLayout()
+
+        sdim_inner_layout = QGridLayout()
+        sdim_inner_layout.setSpacing(8)
+        self.sample_dim_measure_btn = QPushButton("Measure Sample Manually")
+        self.smeasure_tr_btn = QPushButton("Top Right")
+        self.smeasure_bl_btn = QPushButton("Bottom Left")
+
+        # buttons logic
+        self.smeasure_tr_btn.setEnabled(False)
+        self.smeasure_bl_btn.setEnabled(False)
+        self.sample_dim_measure_btn.clicked.connect(self.toggle_manual_measurement)
+        self.sample_dim_measure_btn.setCheckable(True)
+
+        self.temp_top_right = None
+        self.temp_bottom_left = None
+
+        self.smeasure_start_label = QLabel("X: --, Y: --")
+        self.smeasure_end_label = QLabel("X: --, Y: --")
+
+
+        sdim_inner_layout.addWidget(self.sample_dim_measure_btn, 0, 0, 1, 2)
+        sdim_inner_layout.addWidget(self.smeasure_tr_btn, 1, 0)
+        sdim_inner_layout.addWidget(self.smeasure_start_label, 2, 0)
+        sdim_inner_layout.addWidget(self.smeasure_bl_btn, 1, 1)
+        sdim_inner_layout.addWidget(self.smeasure_end_label, 2, 1)
+
+        sdim_layout.addLayout(smeasure_start_end)
+        main_layout.addLayout(sdim_inner_layout)
+
+        # sample measuring logic
+        self.smeasure_tr_btn.clicked.connect(
+            lambda _checked: self.set_sample_corner('topright')
+        )
+
+        self.smeasure_bl_btn.clicked.connect(
+            lambda _checked: self.set_sample_corner('bottomleft')
+        )
+        
 
         # TEMP: display sample/gantry dimensions
         # replace with graphic
@@ -476,10 +534,10 @@ class CoreXYController(QWidget):
             return
 
         # exit if reference point exceeds stage bounds
-        sample_width = int(stages_config.get_sample_width())
-        sample_height = int(stages_config.get_sample_height())
-        gantry_width = int(stages_config.get_gantry_width())
-        gantry_height = int(stages_config.get_gantry_height())
+        sample_width = float(stages_config.get_sample_width())
+        sample_height = float(stages_config.get_sample_height())
+        gantry_width = float(stages_config.get_gantry_width())
+        gantry_height = float(stages_config.get_gantry_height())
 
         xbound = gantry_width - sample_width
         ybound = gantry_height - sample_height
@@ -500,6 +558,88 @@ class CoreXYController(QWidget):
         # tell GRBL the new working position
         self._set_sample_coordinate_system(abs_x=current_x, abs_y=current_y)
         # time.sleep(1)       # avoid sending commands until this is done
+
+
+    def set_sample_corner(self, corner: Literal['topright', 'bottomleft']) -> None:
+        """Captures current workspace positions and sets the specified sample corner.
+        
+        If both corners become populated, initializes or updates self.sample_span_corners.
+        """
+        current_pt = Point(x=self.current_wpos_x, y=self.current_wpos_y)
+        
+        # toggle set point logic
+        if corner == 'topright':
+            if self.temp_top_right is not None:
+                self.temp_top_right = None
+                self.smeasure_tr_btn.setText("Top Right")
+                self.smeasure_start_label.setText("X: --, Y: --")
+            else:
+                self.temp_top_right = current_pt
+                self.smeasure_tr_btn.setText("Clear Top Right")
+                self.smeasure_start_label.setText(f"X: {current_pt.x}, Y: {current_pt.y}")
+
+        elif corner == 'bottomleft':
+            if self.temp_bottom_left is not None:
+                self.temp_bottom_left = None
+                self.smeasure_bl_btn.setText("Bottom Left")
+                self.smeasure_end_label.setText("X: --, Y: --")
+            else:
+                self.temp_bottom_left = current_pt
+                self.smeasure_bl_btn.setText("Clear Bottom Left")
+                self.smeasure_end_label.setText(f"X: {current_pt.x}, Y: {current_pt.y}")
+        else:
+            raise ValueError(f"Invalid corner specifier: {corner}. Expected 'topright' or 'bottomleft'.")
+
+
+    def toggle_manual_measurement(self, checked):
+        
+        if checked:
+            # Begin Measurement
+
+            # Enable corner buttons
+            self.smeasure_tr_btn.setEnabled(True)
+            self.smeasure_bl_btn.setEnabled(True)
+            self.sample_dim_measure_btn.setText("End Measurement")
+        else:
+            # End Measurement
+
+            # # get dimensions
+            # try:
+            #     validate_points(self.temp_top_right, self.temp_bottom_left)
+            # except ValueError:
+            #     print("Invalid points set.")
+            #     return
+
+            # validate sample corners
+            self.sample_span_corners = SpanEndpoints(
+                top_right_corner=self.temp_top_right,
+                bottom_left_corner=self.temp_bottom_left
+            )
+
+            print(self.sample_span_corners)
+            try:
+                self.sample_span_corners.validate_points()
+            except ValueError as e:
+                print(f"Cannot set sample measurement with invalid points: {e}")
+                self.sample_span_corners = SpanEndpoints(
+                    Point(None, None),
+                    Point(None, None)
+                )
+                return
+
+        
+            # Disable corner buttons
+            self.smeasure_tr_btn.setEnabled(False)
+            self.smeasure_bl_btn.setEnabled(False)
+
+            self.smeasure_start_label.setText("X: --, Y: --")
+            self.smeasure_end_label.setText("X: --, Y: --")
+
+            # apply dimensions to line inputs
+            self.stages_config.setWidth(str(self.sample_span_corners.width))
+            self.stages_config.setHeight(str(self.sample_span_corners.height))
+
+            self.sample_dim_measure_btn.setText("Begin Measuring Sample Dimensions")
 
 
     def _set_sample_coordinate_system(self, abs_x: int, abs_y: int):
@@ -536,18 +676,18 @@ class CoreXYController(QWidget):
             print("Input speed before starting scan.")
             return
 
-        if not int(spd):
+        if not float(spd):
             print("Input speed must be an integer.")
             return
 
-        spd = int(spd)
+        spd = float(spd)
         if spd < 1 or spd > 20:
             print(f'Scan speed must be within the limit: [{self.MIN_STAGE_SPEED}, {self.MAX_STAGE_SPEED}] mm/min')
             return
     
-        sampleWidth = int(self.stages_config.get_sample_width())
-        sampleHeight = int(self.stages_config.get_sample_height())
-        resolution = int(self.scan_resolution.text().strip())
+        sampleWidth = float(self.stages_config.get_sample_width())
+        sampleHeight = float(self.stages_config.get_sample_height())
+        resolution = float(self.scan_resolution.text().strip())
         feed_rate = stage_to_motor_speed(spd)
 
         commands = generate_raster_commands(sampleWidth, sampleHeight, resolution, feed_rate).split('\n')
