@@ -216,69 +216,6 @@ class StageSizeConfig(QWidget):
             return False
         
         return True
-    
-
-
-    
-
-
-
-class SizeCard(QFrame):
-    """A reusable card component with a header line and grid form inputs."""
-    def __init__(self, title, border_color="black"):
-        super().__init__()
-        
-        # Style the card with rounded corners and custom border color
-        self.setStyleSheet(f"""
-            QFrame {{
-                border: 2px solid {border_color};
-                border-radius: 8px;
-            }}
-            QLabel {{
-                border: none;
-                font-family: Arial;
-                font-size: 14px;
-            }}
-            QLineEdit {{
-                border: 1px solid #ccc;
-                border-radius: 4px;
-                padding: 2px;
-            }}
-        """)
-        
-        card_layout = QVBoxLayout(self)
-        card_layout.setContentsMargins(10, 5, 10, 10)
-        card_layout.setSpacing(5)
-        
-        # Header text
-        header = QLabel(title)
-        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        header.setStyleSheet("font-weight: bold;")
-        card_layout.addWidget(header)
-        
-        # Separator Line
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Plain)
-        line.setStyleSheet(f"border: 1px solid {border_color}; margin-bottom: 5px;")
-        card_layout.addWidget(line)
-        
-        # Form grid (Width / Height inputs)
-        form_layout = QGridLayout()
-        form_layout.setSpacing(8)
-        
-        form_layout.addWidget(QLabel("Width (cm):"), 0, 0)
-        self.width_input = QLineEdit()
-        form_layout.addWidget(self.width_input, 0, 1)
-        
-        form_layout.addWidget(QLabel("Height (cm):"), 1, 0)
-        self.height_input = QLineEdit()
-        form_layout.addWidget(self.height_input, 1, 1)
-        
-        card_layout.addLayout(form_layout)
-    
-    
-
 
 
 
@@ -294,7 +231,7 @@ class CoreXYController(QWidget):
         self.current_mpos_x = 0.0  # Used for physical machine tracking
         self.current_mpos_y = 0.0
 
-        
+        self.isMoving = False
 
         # Reference Point (Sample Location)
         self.sample_x = None
@@ -322,7 +259,8 @@ class CoreXYController(QWidget):
         self.initUI()
         
     def initUI(self):
-        self.setWindowTitle('FluidNC / GRBL CoreXY Controller')
+        self.setWindowTitle('LIBS Portable Stage Controller')
+        
         main_layout = QVBoxLayout()
 
 
@@ -342,11 +280,19 @@ class CoreXYController(QWidget):
         self.btn_refresh.clicked.connect(self.populate_ports)
 
 
+        # --- Hardware Controls Container (Disabled by default) ---
+        self.controls_container = QWidget()
+        self.controls_container.setEnabled(False)
+        
+        # Internal layout for all hardware controls
+        controls_layout = QVBoxLayout(self.controls_container)
+
+
         # --- Stage Sizes (Sample and Gantry)
         stages_config = StageSizeConfig()
         self.stages_config = stages_config
 
-        main_layout.addWidget(stages_config)
+        controls_layout.addWidget(stages_config)
 
         sample_width = stages_config.get_sample_width()
         sample_height = stages_config.get_sample_height()
@@ -385,7 +331,7 @@ class CoreXYController(QWidget):
         sdim_inner_layout.addWidget(self.smeasure_end_label, 2, 1)
 
         sdim_layout.addLayout(smeasure_start_end)
-        main_layout.addLayout(sdim_inner_layout)
+        controls_layout.addLayout(sdim_inner_layout)
 
         # sample measuring logic
         self.smeasure_tr_btn.clicked.connect(
@@ -409,7 +355,7 @@ class CoreXYController(QWidget):
         dimensions_layout.addWidget(shtext, 0, 1)
         dimensions_layout.addWidget(gwtext, 1, 0)
         dimensions_layout.addWidget(ghtext, 1, 1)
-        main_layout.addLayout(dimensions_layout)
+        controls_layout.addLayout(dimensions_layout)
         stages_config.init_listeners(
             lambda newText: swtext.setText(newText),
             lambda newText: shtext.setText(newText),
@@ -465,7 +411,7 @@ class CoreXYController(QWidget):
 
         # finish manual controls setup
         manual_controls_config.addLayoutToCard(manual_controls_layout)
-        main_layout.addWidget(manual_controls_config)
+        controls_layout.addWidget(manual_controls_config)
 
 
 
@@ -489,16 +435,16 @@ class CoreXYController(QWidget):
         scanning_layout.addLayout(spd_layout)
 
         scanning_config.addLayoutToCard(scanning_layout)
-        main_layout.addWidget(scanning_config)
+        controls_layout.addWidget(scanning_config)
 
 
 
         main_controls_layout = QHBoxLayout()
-        main_layout.addLayout(main_controls_layout)
+        controls_layout.addLayout(main_controls_layout)
 
 
         # Connect UI signals
-        self.btn_home.clicked.connect(lambda: self.send_gcode('$H'))
+        self.btn_home.clicked.connect(lambda: self.home())
         self.btn_up.clicked.connect(lambda: self.jog(axis='Y', direction=1))
         self.btn_down.clicked.connect(lambda: self.jog(axis='Y', direction=-1))
         self.btn_left.clicked.connect(lambda: self.jog(axis='X', direction=-1))
@@ -514,14 +460,15 @@ class CoreXYController(QWidget):
 
         self.btn_raster = QPushButton('START SCAN')
         self.btn_raster.clicked.connect(self.start_scan)
-        main_layout.addWidget(self.btn_raster)
+        controls_layout.addWidget(self.btn_raster)
 
         # unlock button (temporary)
         self.btn_unlock = QPushButton('Unlock Alarm')
         self.btn_unlock.clicked.connect(lambda: self.send_gcode('$X'))
-        main_layout.addWidget(self.btn_unlock)
+        controls_layout.addWidget(self.btn_unlock)
 
         # finish setup
+        main_layout.addWidget(self.controls_container)
         self.setLayout(main_layout)
 
 
@@ -722,6 +669,25 @@ class CoreXYController(QWidget):
         gcode = f"G91\nG1 {axis}{change} F3000\nG90"
         self.send_gcode(gcode)
 
+    def home(self):
+        '''Returns to (0, 0) based on
+        distance travelled away from home.
+        
+        NOT THE SAME as $H homing sequence;
+        that requires limit switches.'''
+        homing_speed = 200   # mm/min
+
+        if self.isMoving:
+            print("Wait until movement is finished")
+            return
+
+        # extract machine position
+        x =  self.current_mpos_x
+        y =  self.current_mpos_y
+
+        self.send_gcode(f'G91 G1 X{-x} F{homing_speed}')
+        self.send_gcode(f'G91 G1 Y{-y} F{homing_speed}')
+
 
     def populate_ports(self):
         """Scans for available serial ports and populates the dropdown."""
@@ -747,6 +713,9 @@ class CoreXYController(QWidget):
     
     def onConnect(self):
         '''Sets up GRBL config.'''
+
+        self.controls_container.setEnabled(True)
+
         # Start polling GRBL for status updates every 100ms
         self.reader_thread = threading.Thread(target=self.read_from_device, daemon=True)
         self.reader_thread.start()
@@ -778,6 +747,10 @@ class CoreXYController(QWidget):
             except Exception as e:
                 print(f"Connection Error: {e}")
         else:
+
+            # disable controls
+            self.controls_container.setEnabled(False)
+
             # close reader threaad
             self.reader_thread.join(timeout=1)
 
@@ -803,6 +776,8 @@ class CoreXYController(QWidget):
         Parses the regular expression coordinates from GRBL/FluidNC status strings.
         Distinguishes between absolute (MPos) and Relative (WPos) coordinates.
         """
+
+        # TODO: check if idle or moving
 
         wco_x, wco_y = self.sample_coordinate_offset
 
@@ -851,6 +826,16 @@ class CoreXYController(QWidget):
 
                         if not line:
                             continue
+
+                        # check state
+                        # update if stage in motion
+                        STATE_REGEX = re.compile(r"^<([^|>]+)\|")
+                        match = STATE_REGEX.search(line)
+                        if match:
+                            state = match.group(1)
+                            self.isMoving = (state != "Idle")
+                            # print(f'stage is{"" if self.isMoving else "N'T"} moving')
+
 
                         # check if status report interrupt is there
                         status_match = self.STATUS_REGEX.search(line)
