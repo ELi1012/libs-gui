@@ -23,11 +23,7 @@ def generate_raster_commands(sampleWidth, sampleHeight, resolution: int, feedrat
         nonlocal commands
         commands += f'{newCommand}\n'
 
-    addCommand('G21')   # set units to metric
-    addCommand('G17')   # set XY plane
-    addCommand('G91')   # set to relative positioning
-
-    addCommand(f'F{feedrate}')
+    addCommand(f'G21 G17 G91 F{feedrate}')   # metric units; XY plane; relative positioning
 
     for current_row in range(0, rows):
         x_movement = f'X{sampleWidth}' if go_right else f'X-{sampleWidth}'
@@ -50,8 +46,8 @@ def generate_raster_commands(sampleWidth, sampleHeight, resolution: int, feedrat
 
 
 if __name__ == '__main__':
-    width = 2
-    height = 5
+    width = 30
+    height = 30
 
     commands = generate_raster_commands(width, height, 1, 1000)
-    print(commands)
+    print(len(commands))

@@ -3,36 +3,28 @@
 Implemented using PyQt6.
 
 Features:
-- Set width/height of sample and gantry (physical frame)
 - Manual controls to jog the stage
-- Scan options: Set resolution of scan
-
-
-Misc notes:
-- sending $# will only update the coordinate offsets if the reader loop is active
+- Scan options: Set resolution/speed of scan
+- Set width/height of sample and gantry (physical frame)
+- Set sample dimensions by jogging stage to sample corners
 
 
 '''
 
 
-import sys
-from typing import Literal
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLineEdit, QLabel, QGridLayout,
                              QFrame, QComboBox)
-from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtSerialPort import QSerialPortInfo
-import serial
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QApplication
+
+import sys
 import re
-import threading
-import time
-import re
+from typing import Literal
 
 from raster import generate_raster_commands
 from sample import Point, SpanEndpoints
-
-
-
+from hardware.serial_driver import SerialWorker
 
 
 class ConfigCard(QFrame):
@@ -97,7 +89,6 @@ class StageSizeConfig(QWidget):
         self.sample_frame = ConfigCard('Sample Size')
         self.config_layout.addWidget(self.sample_frame)
         sample_layout = QGridLayout()
-        # sample_layout.setSpacing(8)
 
         # manual width/height input
         sample_layout.addWidget(QLabel("Width (cm):"), 0, 0)
@@ -205,7 +196,6 @@ class StageSizeConfig(QWidget):
 
         # empty?
         if not width or not height:
-            print('empty')
             return False
         
         # is number?
@@ -224,6 +214,16 @@ class CoreXYController(QWidget):
         super().__init__()
         self.serial_port = None
 
+
+        # --- Settings ---
+        self.JOG_SPEED = 500                # mm/min
+        self.SAMPLE_HOMING_SPEED = 300      # mm/min
+        self.PHYSICAL_HOMING_SPEED = 200    # mm/min
+
+        self.MAX_STAGE_SPEED = 20       # mm/min
+        self.MIN_STAGE_SPEED = 1        # mm/min
+
+
         # --- Internal Coordinate Tracking ---
         self.current_wpos_x = 0.0  # Used for Sample Boundary checking
         self.current_wpos_y = 0.0
@@ -237,24 +237,25 @@ class CoreXYController(QWidget):
         self.sample_x = None
         self.sample_y = None
         self.sample_coordinate_offset = (0, 0)      # update when connecting
-        self.sample_span_corners = SpanEndpoints(
+        self.sample_endpoints = SpanEndpoints(
             Point(None, None),
             Point(None, None)
         )
 
         # send-line protocol
-        self.command_semaphore = threading.Semaphore(1) # Allows 1 command at a time
         self.STATUS_REGEX = re.compile(r'<(.*?)>')
         
-        # default feed rate
-        self.DEFAULT_FEED_RATE = 800        # mm/min
-        # TODO: set feed rate on serial connection
-        self.MAX_STAGE_SPEED = 20       # mm/min
-        self.MIN_STAGE_SPEED = 1        # mm/min
 
-        # how often to update position
-        self.MOTION_REPORTING_INTERVAL = 50     # milliseconds
+        # connect serial events
+        self.serial = SerialWorker()
+        self.serial.signals.position_updated.connect(self.updatePosition)
+        self.serial.signals.offset_updated.connect(self.updateWorkCoordinateOffset)
+        self.serial.signals.status_changed.connect(self.updateStatus)
+        self.serial.signals.batch_processed.connect(self.handleRasterFinished)
 
+        # Valid states types:  `Idle, Run, Hold, Jog, Alarm, Door, Check, Home, Sleep`
+        self.status = ""
+        self.NOT_MOVING_STATUSES = ["Idle", "Hold", "Alarm"]
 
         self.initUI()
         
@@ -266,15 +267,20 @@ class CoreXYController(QWidget):
 
         # --- Connection Row
         conn_layout = QHBoxLayout()
+
+        port_lbl_layout = QHBoxLayout() # combo box + label
         self.port_combo = QComboBox() 
-        # self.port_input = QLineEdit('/dev/cu.usbmodem101') 
         self.btn_refresh = QPushButton("Refresh")
         self.btn_connect = QPushButton('Connect')
         self.btn_connect.clicked.connect(self.toggle_connection)
-        conn_layout.addWidget(QLabel('Port:'))
-        conn_layout.addWidget(self.port_combo)
-        conn_layout.addWidget(self.btn_refresh)
-        conn_layout.addWidget(self.btn_connect)
+        self.btn_connect.setEnabled(False)
+        self.port_combo.currentIndexChanged.connect(lambda: self.btn_connect.setEnabled(True))
+        port_lbl_layout.addWidget(QLabel('Port:'), 1)
+        port_lbl_layout.addWidget(self.port_combo, 3)
+
+        conn_layout.addLayout(port_lbl_layout, 3)
+        conn_layout.addWidget(self.btn_refresh, 1)
+        conn_layout.addWidget(self.btn_connect, 1)
         main_layout.addLayout(conn_layout)
 
         self.btn_refresh.clicked.connect(self.populate_ports)
@@ -282,140 +288,161 @@ class CoreXYController(QWidget):
 
         # --- Hardware Controls Container (Disabled by default) ---
         self.controls_container = QWidget()
-        self.controls_container.setEnabled(False)
+        self.controls_container.setEnabled(True)
+        # self.controls_container.setEnabled(False)
         
         # Internal layout for all hardware controls
-        controls_layout = QVBoxLayout(self.controls_container)
+        controls_layout = QGridLayout(self.controls_container)
+        controls_layout.setSpacing(16)
+
+
+        # ----- DIMENSIONS CONTROL -----
+        # For configuring machine + sample dimensions.
 
 
         # --- Stage Sizes (Sample and Gantry)
         stages_config = StageSizeConfig()
         self.stages_config = stages_config
 
-        controls_layout.addWidget(stages_config)
-
-        sample_width = stages_config.get_sample_width()
-        sample_height = stages_config.get_sample_height()
-        gantry_width = stages_config.get_gantry_width()
-        gantry_height = stages_config.get_gantry_height()
-
+        controls_layout.addWidget(stages_config, 0, 0)
 
         # Set sample dimensions via jogging
+        smeasure_config = ConfigCard("Measure Sample Manually")
+        smeasure_layout = QGridLayout()
+        smeasure_layout.setSpacing(8)
 
-        sdim_layout = QVBoxLayout()
-        smeasure_start_end = QHBoxLayout()
-
-        sdim_inner_layout = QGridLayout()
-        sdim_inner_layout.setSpacing(8)
-        self.sample_dim_measure_btn = QPushButton("Measure Sample Manually")
-        self.smeasure_tr_btn = QPushButton("Top Right")
-        self.smeasure_bl_btn = QPushButton("Bottom Left")
+        self.smeasure_toggle_btn = QPushButton("Begin Measuring Sample Dim.")
+        self.smeasure_c1_btn = QPushButton("Corner 1")
+        self.smeasure_c2_btn = QPushButton("Corner 2")
 
         # buttons logic
-        self.smeasure_tr_btn.setEnabled(False)
-        self.smeasure_bl_btn.setEnabled(False)
-        self.sample_dim_measure_btn.clicked.connect(self.toggle_manual_measurement)
-        self.sample_dim_measure_btn.setCheckable(True)
+        self.smeasure_c1_btn.setEnabled(False)
+        self.smeasure_c2_btn.setEnabled(False)
+        self.smeasure_toggle_btn.clicked.connect(self.toggle_manual_measurement)
+        self.smeasure_toggle_btn.setCheckable(True)
 
-        self.temp_top_right = None
-        self.temp_bottom_left = None
+        self.temp_corner1 = None
+        self.temp_corner2 = None
 
-        self.smeasure_start_label = QLabel("X: --, Y: --")
-        self.smeasure_end_label = QLabel("X: --, Y: --")
+        self.smeasure_start_label = QLabel("Corner 1: --")
+        self.smeasure_end_label = QLabel("Corner 2: --")
+
+        smeasure_layout.addWidget(self.smeasure_toggle_btn, 0, 0, 1, 2)
+        smeasure_layout.addWidget(self.smeasure_c1_btn, 1, 0)
+        smeasure_layout.addWidget(self.smeasure_start_label, 2, 0)
+        smeasure_layout.addWidget(self.smeasure_c2_btn, 1, 1)
+        smeasure_layout.addWidget(self.smeasure_end_label, 2, 1)
 
 
-        sdim_inner_layout.addWidget(self.sample_dim_measure_btn, 0, 0, 1, 2)
-        sdim_inner_layout.addWidget(self.smeasure_tr_btn, 1, 0)
-        sdim_inner_layout.addWidget(self.smeasure_start_label, 2, 0)
-        sdim_inner_layout.addWidget(self.smeasure_bl_btn, 1, 1)
-        sdim_inner_layout.addWidget(self.smeasure_end_label, 2, 1)
-
-        sdim_layout.addLayout(smeasure_start_end)
-        controls_layout.addLayout(sdim_inner_layout)
 
         # sample measuring logic
-        self.smeasure_tr_btn.clicked.connect(
-            lambda _checked: self.set_sample_corner('topright')
+        self.smeasure_c1_btn.clicked.connect(
+            lambda _checked: self.set_sample_corner('corner1')
         )
 
-        self.smeasure_bl_btn.clicked.connect(
-            lambda _checked: self.set_sample_corner('bottomleft')
+        self.smeasure_c2_btn.clicked.connect(
+            lambda _checked: self.set_sample_corner('corner2')
         )
+
+        smeasure_config.addLayoutToCard(smeasure_layout)
+        controls_layout.addWidget(smeasure_config, 0, 1)
         
 
-        # TEMP: display sample/gantry dimensions
-        # replace with graphic
 
-        dimensions_layout = QGridLayout()
-        swtext = QLabel(sample_width)
-        shtext = QLabel(sample_height)
-        gwtext = QLabel(gantry_width)
-        ghtext = QLabel(gantry_height)
-        dimensions_layout.addWidget(swtext, 0, 0)
-        dimensions_layout.addWidget(shtext, 0, 1)
-        dimensions_layout.addWidget(gwtext, 1, 0)
-        dimensions_layout.addWidget(ghtext, 1, 1)
-        controls_layout.addLayout(dimensions_layout)
-        stages_config.init_listeners(
-            lambda newText: swtext.setText(newText),
-            lambda newText: shtext.setText(newText),
-            lambda newText: gwtext.setText(newText),
-            lambda newText: ghtext.setText(newText),
-        )
+        # --- MANUAL CONTROLS ---
+        jogging_config = ConfigCard("Manual Controls")
+
+        jogging_layout = QHBoxLayout()
+        jogging_layout.setSpacing(16)
+        jog_rightside_layout = QVBoxLayout()
+        jog_rightside_layout.setSpacing(16)
+
+
+        jog_leftside_layout = QVBoxLayout()
+
+
+        # arrow controls
+        keypad_widget = QWidget()       # widget to set max width
+        keypad_widget.setMaximumWidth(400)  
+        keypad_layout = QGridLayout(keypad_widget)
+        keypad_layout.setSpacing(8)
+
+        self.btn_up = QPushButton('▲ Up')
+        self.btn_down = QPushButton('▼ Down')
+        self.btn_left = QPushButton('◀ Left')
+        self.btn_right = QPushButton('▶ Right')
+        # self.btn_home = QPushButton('Home')
+
+        # Arrange in a classic keypad layout
+        keypad_layout.addWidget(self.btn_up, 0, 1)
+        keypad_layout.addWidget(self.btn_left, 1, 0)
+        # keypad_layout.addWidget(self.btn_home, 1, 1)
+        keypad_layout.addWidget(self.btn_right, 1, 2)
+        keypad_layout.addWidget(self.btn_down, 2, 1)
+
         
 
-        
+        # Connect UI signals
+        # self.btn_home.clicked.connect(lambda: self.go_to_part_zero())
+        self.btn_up.clicked.connect(lambda: self.jog(axis='Y', direction=1))
+        self.btn_down.clicked.connect(lambda: self.jog(axis='Y', direction=-1))
+        self.btn_left.clicked.connect(lambda: self.jog(axis='X', direction=-1))
+        self.btn_right.clicked.connect(lambda: self.jog(axis='X', direction=1))
 
-        # --- Manual Controls
-        manual_controls_config = ConfigCard("Manual Controls")
+        jog_leftside_layout.addWidget(keypad_widget)
 
-        manual_controls_layout = QVBoxLayout()
-
-        # step size
+        # step size input
         step_size_layout = QHBoxLayout()
         step_size_layout.addWidget(QLabel('Step Size:'))
         self.jog_step_size = QLineEdit('2')
         step_size_layout.addWidget(self.jog_step_size)
-        manual_controls_layout.addLayout(step_size_layout)
+        jog_leftside_layout.addLayout(step_size_layout)
 
-        # arrow controls
-        grid_layout = QGridLayout()
-        
-        self.btn_up = QPushButton('▲ Up (+Y)')
-        self.btn_down = QPushButton('▼ Down (-Y)')
-        self.btn_left = QPushButton('◀ Left (-X)')
-        self.btn_right = QPushButton('▶ Right (+X)')
-        self.btn_home = QPushButton('Home ($H)')
+        # - Set and Return to Reference Point
+        ref_point_layout = QHBoxLayout()
 
-        # Arrange in a classic keypad layout
-        grid_layout.addWidget(self.btn_up, 0, 1)
-        grid_layout.addWidget(self.btn_left, 1, 0)
-        grid_layout.addWidget(self.btn_home, 1, 1)
-        grid_layout.addWidget(self.btn_right, 1, 2)
-        grid_layout.addWidget(self.btn_down, 2, 1)
-
-        manual_controls_layout.addLayout(grid_layout)
-
-
-        # footer
-        manual_footer_layout = QHBoxLayout()
-        manual_footer_layout.setSpacing(10)
-        sample_gantry_toggle = QPushButton("Sample/Gantry") # TODO: conditional text
+        # set new sample home
         set_ref_btn = QPushButton("Set Ref. Point")
         set_ref_btn.clicked.connect(self.set_new_reference_point)
+        ref_point_layout.addWidget(set_ref_btn)
 
-        manual_footer_layout.addWidget(sample_gantry_toggle)
-        manual_footer_layout.addWidget(set_ref_btn)
+        # return to sample home
+        self.return_ref_btn = QPushButton("Return to Ref. Point")
+        self.return_ref_btn.clicked.connect(self.go_to_part_zero)
+        ref_point_layout.addWidget(self.return_ref_btn)
 
-        manual_controls_layout.addLayout(manual_footer_layout)
+        jog_leftside_layout.addLayout(ref_point_layout)
+
+
+        # -- right side of manual controls
+
+        # sample/gantry homing toggle
+        homing_btn = QPushButton("Home Machine")
+        homing_btn.setStyleSheet("background-color: #4CAF50; color: white;")
+        homing_btn.clicked.connect(lambda: self.serial.send_command("$H"))
+        jog_rightside_layout.addWidget(homing_btn)
+
+
+        estop_btn = QPushButton("Emergency Stop")
+        estop_btn.setStyleSheet("background-color: #DC143C; color: white;")
+        estop_btn.clicked.connect(lambda: self.serial.emergency_stop())
+        jog_rightside_layout.addWidget(estop_btn)
+
+
+        
+        # jog_rightside_layout.addWidget(set_ref_btn)
+
+
+        # add right and left side layout
+        jogging_layout.addLayout(jog_leftside_layout)
+        jogging_layout.addLayout(jog_rightside_layout)
 
         # finish manual controls setup
-        manual_controls_config.addLayoutToCard(manual_controls_layout)
-        controls_layout.addWidget(manual_controls_config)
+        jogging_config.addLayoutToCard(jogging_layout)
+        controls_layout.addWidget(jogging_config, 1, 0)
 
 
-
-        # --- Scan Options
+        # --- Scan Options ---
 
         scanning_config = ConfigCard("Scan Options")
         scanning_layout = QVBoxLayout()
@@ -435,44 +462,127 @@ class CoreXYController(QWidget):
         scanning_layout.addLayout(spd_layout)
 
         scanning_config.addLayoutToCard(scanning_layout)
-        controls_layout.addWidget(scanning_config)
-
-
-
-        main_controls_layout = QHBoxLayout()
-        controls_layout.addLayout(main_controls_layout)
-
-
-        # Connect UI signals
-        self.btn_home.clicked.connect(lambda: self.home())
-        self.btn_up.clicked.connect(lambda: self.jog(axis='Y', direction=1))
-        self.btn_down.clicked.connect(lambda: self.jog(axis='Y', direction=-1))
-        self.btn_left.clicked.connect(lambda: self.jog(axis='X', direction=-1))
-        self.btn_right.clicked.connect(lambda: self.jog(axis='X', direction=1))
+        controls_layout.addWidget(scanning_config, 1, 1)
 
 
         # Real-time Position Readout Labels for safety awareness
-        self.lbl_pos = QLabel("Current Machine Position: X: 0.00, Y: 0.00")
+        self.lbl_pos = QLabel("Current Machine Position: Unknown")
         scanning_layout.addWidget(self.lbl_pos)
 
 
         # --- RASTER BUTTON ---
 
+        self.raster_layout = QHBoxLayout()
+        self.raster_layout.setContentsMargins(0, 20, 0, 0)
         self.btn_raster = QPushButton('START SCAN')
-        self.btn_raster.clicked.connect(self.start_scan)
-        controls_layout.addWidget(self.btn_raster)
+        self.btn_raster.setStyleSheet("""
+            QPushButton {
+                font-size: 18px;
+                font-weight: bold;
 
-        # unlock button (temporary)
-        self.btn_unlock = QPushButton('Unlock Alarm')
-        self.btn_unlock.clicked.connect(lambda: self.send_gcode('$X'))
-        controls_layout.addWidget(self.btn_unlock)
+                background-color: #4CAF50; 
+                color: white;
+            }
+        """)
+        self.btn_raster.clicked.connect(self.start_scan)
+        self.raster_layout.addWidget(self.btn_raster)
+
+        self.toggle_movement_btn = QPushButton('Stop')
+        self.toggle_movement_btn.setCheckable(True)
+        self.toggle_movement_btn.setChecked(False)
+        self.toggle_movement_btn.clicked.connect(lambda _checked: self.handleToggleMovement(_checked))
+
+        self.raster_layout.addWidget(self.toggle_movement_btn)
+
+        # # unlock button (temporary)
+        # self.btn_unlock = QPushButton('Unlock Alarm')
+        # self.btn_unlock.clicked.connect(lambda: self.serial.unlock_alarm())
+        # controls_layout.addWidget(self.btn_unlock, 2, 1)
+
+        controls_layout.addLayout(self.raster_layout, 2, 0, 1, 2)
+
 
         # finish setup
         main_layout.addWidget(self.controls_container)
         self.setLayout(main_layout)
 
 
+    def updatePosition(self, pos_type, x, y, new_wco):
+        '''Called when position OR wco updates.'''
+        # If `WPos:` is given, use `MPos = WPos + WCO`.
+        # If `MPos:` is given, use `WPos = MPos - WCO`.
+
+        if not new_wco:     # empty if not given
+            wco_x, wco_y = self.sample_coordinate_offset
+        else:
+            wco_x, wco_y = new_wco
+
+        if pos_type == "WPos":
+            
+            self.current_wpos_x = x
+            self.current_wpos_y = y
+
+            self.current_mpos_x = x + wco_x
+            self.current_mpos_y = y + wco_y
+
+
+        elif pos_type == "MPos":
+            self.current_mpos_x = x
+            self.current_mpos_y = y
+
+            self.current_wpos_x = x - wco_x
+            self.current_wpos_y = x - wco_y
+            
+        
+        # Update the GUI readout label
+        self.lbl_pos.setText(
+            f"Absolute (MPos) -> X: {self.current_mpos_x:.2f}, Y: {self.current_mpos_y:.2f}\n"
+            f"Sample   (WPos) -> X: {self.current_wpos_x:.2f}, Y: {self.current_wpos_y:.2f}"
+        )
+
+    def updateWorkCoordinateOffset(self, wco_x, wco_y):
+        # update model
+        self.sample_coordinate_offset = (wco_x, wco_y)
+        self.updatePosition("WPos", self.current_wpos_x, self.current_wpos_y, [wco_x, wco_y])
+
+
+    def updateStatus(self, status):
+        self.status = status
+        self.isMoving = status not in self.NOT_MOVING_STATUSES
+
+        if status == 'Alarm':
+            print("! ALARM TRIGGERED !\nHome machine to continue, or restart program.")
+
+
+    def handleRasterFinished(self):
+        self.toggle_movement_btn.setChecked(False)
+
+
+    def cancelRaster(self):
+        # Add to button if a soft cancel is desired
+        # Finishes current movement and cancels all queued commands
+
+        self.serial.clear_command_queue()
+        self.toggle_movement_btn.setChecked(False)
+
+
+    def handleToggleMovement(self, isChecked):
+        '''Sends either `!` feed hold or `~` cycle resume.
+        Note: Does not work on homing or alarm state.'''
+
+        if isChecked:
+            # Stop movement
+            self.serial.send_immediate('!')
+            self.toggle_movement_btn.setText("Resume")
+        else:
+            # Resume movement
+            self.serial.send_immediate('~')
+            self.toggle_movement_btn.setText("Stop")
+
+
+
     def set_new_reference_point(self):
+        # Input validation + call to update model
         stages_config = self.stages_config
 
         # exit if sample width and height not set
@@ -489,53 +599,47 @@ class CoreXYController(QWidget):
         xbound = gantry_width - sample_width
         ybound = gantry_height - sample_height
 
-        current_x = self.current_mpos_x
-        current_y = self.current_mpos_y
+        mpos_x = self.current_mpos_x
+        mpos_y = self.current_mpos_y
 
-        if current_x > xbound or current_y > ybound:
+        if mpos_x > xbound or mpos_y > ybound:
             print("Reference point cannot exceed stage bounds.")
             return
 
 
-        # set sample x/y to current machine position
-        # machine position == absolute coordinate system
-        self.sample_x = current_x
-        self.sample_y = current_y
-
         # tell GRBL the new working position
-        self._set_sample_coordinate_system(abs_x=current_x, abs_y=current_y)
-        # time.sleep(1)       # avoid sending commands until this is done
+        self.serial.set_working_coordinate_system(mpos_x, mpos_y)
 
 
-    def set_sample_corner(self, corner: Literal['topright', 'bottomleft']) -> None:
+    def set_sample_corner(self, corner: Literal['corner1', 'corner2']) -> None:
         """Captures current workspace positions and sets the specified sample corner.
         
-        If both corners become populated, initializes or updates self.sample_span_corners.
+        If both corners become populated, initializes or updates self.sample_endpoints.
         """
         current_pt = Point(x=self.current_wpos_x, y=self.current_wpos_y)
         
         # toggle set point logic
-        if corner == 'topright':
-            if self.temp_top_right is not None:
-                self.temp_top_right = None
-                self.smeasure_tr_btn.setText("Top Right")
-                self.smeasure_start_label.setText("X: --, Y: --")
+        if corner == 'corner1':
+            if self.temp_corner1 is not None:
+                self.temp_corner1 = None
+                self.smeasure_c1_btn.setText("Corner 1")
+                self.smeasure_start_label.setText("Corner 1: --")
             else:
-                self.temp_top_right = current_pt
-                self.smeasure_tr_btn.setText("Clear Top Right")
+                self.temp_corner1 = current_pt
+                self.smeasure_c1_btn.setText("Clear Corner 1")
                 self.smeasure_start_label.setText(f"X: {current_pt.x}, Y: {current_pt.y}")
 
-        elif corner == 'bottomleft':
-            if self.temp_bottom_left is not None:
-                self.temp_bottom_left = None
-                self.smeasure_bl_btn.setText("Bottom Left")
-                self.smeasure_end_label.setText("X: --, Y: --")
+        elif corner == 'corner2':
+            if self.temp_corner2 is not None:
+                self.temp_corner2 = None
+                self.smeasure_c2_btn.setText("Corner 2")
+                self.smeasure_end_label.setText("Corner 2: --")
             else:
-                self.temp_bottom_left = current_pt
-                self.smeasure_bl_btn.setText("Clear Bottom Left")
+                self.temp_corner2 = current_pt
+                self.smeasure_c2_btn.setText("Clear Corner 2")
                 self.smeasure_end_label.setText(f"X: {current_pt.x}, Y: {current_pt.y}")
         else:
-            raise ValueError(f"Invalid corner specifier: {corner}. Expected 'topright' or 'bottomleft'.")
+            raise ValueError(f"Invalid corner specifier: {corner}. Expected 'corner1' or 'corner2'.")
 
 
     def toggle_manual_measurement(self, checked):
@@ -544,59 +648,47 @@ class CoreXYController(QWidget):
             # Begin Measurement
 
             # Enable corner buttons
-            self.smeasure_tr_btn.setEnabled(True)
-            self.smeasure_bl_btn.setEnabled(True)
-            self.sample_dim_measure_btn.setText("End Measurement")
+            self.smeasure_c1_btn.setEnabled(True)
+            self.smeasure_c2_btn.setEnabled(True)
+            self.smeasure_toggle_btn.setText("End Measurement")
         else:
             # End Measurement
 
-            # # get dimensions
-            # try:
-            #     validate_points(self.temp_top_right, self.temp_bottom_left)
-            # except ValueError:
-            #     print("Invalid points set.")
-            #     return
-
             # validate sample corners
-            self.sample_span_corners = SpanEndpoints(
-                top_right_corner=self.temp_top_right,
-                bottom_left_corner=self.temp_bottom_left
+            self.sample_endpoints = SpanEndpoints(
+                corner1=self.temp_corner1,
+                corner2=self.temp_corner2
             )
 
-            print(self.sample_span_corners)
             try:
-                self.sample_span_corners.validate_points()
+                self.sample_endpoints.validate_points()
             except ValueError as e:
                 print(f"Cannot set sample measurement with invalid points: {e}")
-                self.sample_span_corners = SpanEndpoints(
+                self.sample_endpoints = SpanEndpoints(
                     Point(None, None),
                     Point(None, None)
                 )
+
+                self.smeasure_toggle_btn.setChecked(True)
                 return
 
         
             # Disable corner buttons
-            self.smeasure_tr_btn.setEnabled(False)
-            self.smeasure_bl_btn.setEnabled(False)
+            self.smeasure_c1_btn.setEnabled(False)
+            self.smeasure_c2_btn.setEnabled(False)
 
             self.smeasure_start_label.setText("X: --, Y: --")
             self.smeasure_end_label.setText("X: --, Y: --")
 
             # apply dimensions to line inputs
-            self.stages_config.setWidth(str(self.sample_span_corners.width))
-            self.stages_config.setHeight(str(self.sample_span_corners.height))
+            self.stages_config.setWidth(str(self.sample_endpoints.width))
+            self.stages_config.setHeight(str(self.sample_endpoints.height))
 
-            self.sample_dim_measure_btn.setText("Begin Measuring Sample Dimensions")
+            # clear temp inputs
+            self.temp_corner1 = None
+            self.temp_corner2 = None
 
-
-    def _set_sample_coordinate_system(self, abs_x: int, abs_y: int):
-        ''''''
-        # set current location as (0, 0) of sample coordinate system
-        self.send_gcode(f'G10 L2 P1 X{abs_x} Y{abs_y}')
-        self.send_gcode('G54')      # set G54 as current coordinate system
-        
-        # reader thread will automatically parse the output coordinate systems (G54)
-        self.send_gcode('$#')
+            self.smeasure_toggle_btn.setText("Begin Measuring Sample Dimensions")
 
 
     def start_scan(self):
@@ -628,7 +720,7 @@ class CoreXYController(QWidget):
             return
 
         spd = float(spd)
-        if spd < 1 or spd > 20:
+        if spd < self.MIN_STAGE_SPEED or spd > self.MAX_STAGE_SPEED:
             print(f'Scan speed must be within the limit: [{self.MIN_STAGE_SPEED}, {self.MAX_STAGE_SPEED}] mm/min')
             return
     
@@ -638,8 +730,7 @@ class CoreXYController(QWidget):
         feed_rate = stage_to_motor_speed(spd)
 
         commands = generate_raster_commands(sampleWidth, sampleHeight, resolution, feed_rate).split('\n')
-        for command in commands:
-            self.send_gcode(command)
+        self.serial.send_batch_commands(commands)
 
 
     def jog(self, axis, direction):
@@ -665,35 +756,50 @@ class CoreXYController(QWidget):
         if not (0 <= target_mpos_x <= limit_x and 0 <= target_mpos_y <= limit_y):
             print(f"⚠️ MOVE BLOCKED! Target position ({target_mpos_x:.2f}, {target_mpos_y:.2f}) exceeds gantry limits.")
             return 
-        
-        gcode = f"G91\nG1 {axis}{change} F3000\nG90"
-        self.send_gcode(gcode)
 
-    def home(self):
-        '''Returns to (0, 0) based on
-        distance travelled away from home.
-        
-        NOT THE SAME as $H homing sequence;
-        that requires limit switches.'''
-        homing_speed = 200   # mm/min
+        self.serial.jog(axis, change, self.JOG_SPEED)
+
+
+    def go_to_part_zero(self):
+        '''Returns to (0, 0) with respect to *sample* coordinates.
+        Requires sample coordinate system (G54) to be defined.
+        '''
+
+        x = self.current_wpos_x
+        y = self.current_wpos_y
 
         if self.isMoving:
             print("Wait until movement is finished")
             return
 
-        # extract machine position
-        x =  self.current_mpos_x
-        y =  self.current_mpos_y
+        self.serial.pseudo_home(x, y, self.SAMPLE_HOMING_SPEED)
 
-        self.send_gcode(f'G91 G1 X{-x} F{homing_speed}')
-        self.send_gcode(f'G91 G1 Y{-y} F{homing_speed}')
+
+    def home(self):
+        '''Sends $H to begin homing sequence.
+        
+        If pseudohoming: Returns to (0, 0) based on
+        distance travelled away from home.
+        
+        '''
+
+        use_pseudo_homing = True    # set false if limit switch homing works
+
+        if self.isMoving:
+            print("Wait until movement is finished")
+            return
+
+        if not use_pseudo_homing:
+            self.serial.send_command("$H")
+        else:
+            self.serial.pseudo_home(self.current_mpos_x, self.current_mpos_y, self.PHYSICAL_HOMING_SPEED)
 
 
     def populate_ports(self):
         """Scans for available serial ports and populates the dropdown."""
         self.port_combo.clear()
         
-        ports = QSerialPortInfo.availablePorts()
+        ports = self.serial.list_available_ports()
         
         if not ports:
             self.port_combo.addItem("No ports found", None)
@@ -710,39 +816,21 @@ class CoreXYController(QWidget):
     def get_selected_port(self):
         """Returns the actual system device name to pass to your serial handler."""
         return self.port_combo.currentData()
+
     
     def onConnect(self):
-        '''Sets up GRBL config.'''
-
         self.controls_container.setEnabled(True)
 
-        # Start polling GRBL for status updates every 100ms
-        self.reader_thread = threading.Thread(target=self.read_from_device, daemon=True)
-        self.reader_thread.start()
-        
-        # Wake up and initialize GRBL
-        self.serial_port.write(b"\r\n\r\n")
-        time.sleep(2)
-        self.serial_port.reset_input_buffer()
-
-
-        # TODO: remove
-        self.send_gcode("$X")
-        self.send_gcode('$#')   # load existing sample coordinates
-        self.send_gcode('$10=0')   # set query to return work position (WPos)
-        self.send_gcode(f'$Report/Interval={self.MOTION_REPORTING_INTERVAL}')   # set automatic querying
-        self.send_gcode(f'G21 G17 F{self.DEFAULT_FEED_RATE}')   # units in mm, XY plane, speed
-    
 
     def toggle_connection(self):
-        if self.serial_port is None or not self.serial_port.is_open:
+        if not self.serial.port_open():
             try:
-                print(self.get_selected_port())
-                self.serial_port = serial.Serial(self.get_selected_port(), 115200, timeout=0.1)
+                selected_port = self.get_selected_port()
+
+                self.serial.connect_to(selected_port)
                 self.btn_connect.setText('Disconnect')
 
                 self.onConnect()
-
 
             except Exception as e:
                 print(f"Connection Error: {e}")
@@ -751,125 +839,16 @@ class CoreXYController(QWidget):
             # disable controls
             self.controls_container.setEnabled(False)
 
-            # close reader threaad
-            self.reader_thread.join(timeout=1)
-
-            print('close serial port')
-            self.serial_port.close()
+            self.serial.disconnect_port()
             self.btn_connect.setText('Connect')
 
-    def send_gcode(self, command):
-        if self.serial_port and self.serial_port.is_open:
-            threading.Thread(target=self._background_send, args=(command,), daemon=True).start()
-    
-    def _background_send(self, command):
-        '''Background thread allows semaphore acquisition without blocking main thread.'''
-        for line in command.split('\n'):
-            line = line.strip()
-            if line:
-                self.command_semaphore.acquire()
-                self.serial_port.write(f"{line}\n".encode('utf-8'))
 
+    def closeEvent(self, event):
+        # Stop background workers and close the serial port
+        if hasattr(self, "serial"):
+            self.serial.stop()
+        event.accept()
 
-    def parse_fluidnc_line(self, text):
-        """
-        Parses the regular expression coordinates from GRBL/FluidNC status strings.
-        Distinguishes between absolute (MPos) and Relative (WPos) coordinates.
-        """
-
-        # TODO: check if idle or moving
-
-        wco_x, wco_y = self.sample_coordinate_offset
-
-        wpos_match = re.search(r'WPos:(-?\d+\.\d+),(-?\d+\.\d+),(-?\d+\.\d+)', text)
-
-        if not wpos_match:
-            print('!!! Work position not being reported in status query `?` !!!\nUpdate configuration to report Work Position.')
-            return
-        
-        # extract work position coordinates
-        self.current_wpos_x = float(wpos_match.group(1))
-        self.current_wpos_y = float(wpos_match.group(2))
-        
-        # calculate abs position using offset
-        self.current_mpos_x = self.current_wpos_x + wco_x
-        self.current_mpos_y = self.current_wpos_y + wco_y
-
-        # 4. Update the GUI readout label cleanly showing both systems
-        self.lbl_pos.setText(
-            f"Absolute (MPos) -> X: {self.current_mpos_x:.2f}, Y: {self.current_mpos_y:.2f}\n"
-            f"Sample   (WPos) -> X: {self.current_wpos_x:.2f}, Y: {self.current_wpos_y:.2f}"
-        )
-
-
-
-    def read_from_device(self):
-        buffer = b""
-        while self.serial_port and self.serial_port.is_open:
-            try:
-
-                if not self.serial_port or not self.serial_port.is_open:
-                    break       # port disconnected
-                
-                if not self.serial_port.in_waiting:
-                    # prevent hogging CPU cycles
-                    time.sleep(0.01)
-                else:
-                
-                    # read whatever is waiting in the serial buffer
-                    buffer += self.serial_port.read(self.serial_port.in_waiting)
-
-                    # split by newline
-                    while b"\n" in buffer:
-                        line_bytes, buffer = buffer.split(b"\n", 1)
-                        line = line_bytes.decode("utf-8").strip()
-
-                        if not line:
-                            continue
-
-                        # check state
-                        # update if stage in motion
-                        STATE_REGEX = re.compile(r"^<([^|>]+)\|")
-                        match = STATE_REGEX.search(line)
-                        if match:
-                            state = match.group(1)
-                            self.isMoving = (state != "Idle")
-                            # print(f'stage is{"" if self.isMoving else "N'T"} moving')
-
-
-                        # check if status report interrupt is there
-                        status_match = self.STATUS_REGEX.search(line)
-                        if status_match:
-                            status_line = f"<{status_match.group(1)}>"
-                            self.parse_fluidnc_line(status_line)
-                            
-                            # Remove the status block from the line so we can parse what's left
-                            line = self.STATUS_REGEX.sub('', line).strip()
-
-                        # sort status reports
-                        if not line:
-                            continue
-
-                        if line == 'ok' or line.startswith('error:'):  # comment out this line if arduino not connected
-                            self.command_semaphore.release()   # allow next command to execute
-                        if line.startswith('[G54:') and line.endswith(']'):
-                            # Match G54 followed by 3 comma-separated decimal/negative numbers
-                            match = re.match(r'^\[G54:(-?\d+\.?\d*),(-?\d+\.?\d*),(-?\d+\.?\d*)\]$', line)
-                            if match:
-                                x_co_offset = float(match.group(1))
-                                y_co_offset = float(match.group(2))
-                                
-                                print(f'update coordinate offset: {x_co_offset}, {y_co_offset}')
-                                self.sample_coordinate_offset = (x_co_offset, y_co_offset)
-                        else:
-                            print(f"Controller: {line}")
-
-            except (OSError, serial.SerialException) as e:
-                # Catch the port closing exception silently since it's an intentional disconnect
-                print("Serial port disconnected or closed.")
-                break
-            except Exception as e:
-                print(f"Read error: {e}")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
